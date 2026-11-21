@@ -1,0 +1,471 @@
+desc:X32-style Combinator (5-Band Multiband Compressor, ohne SBC)
+// Nachbau der Bedienlogik des X32/M32 "Combinator" fuer Offline-Uebung in REAPER.
+// Kein Klon des Original-DSP. Crossover-Grundfrequenzen und Attack-Skala sind geschaetzt.
+//
+// Band-Threshold = globaler Threshold + Band Thr (Offset)
+// Band-Makeup    = globaler Gain + Band Gain
+// Band Lock      = keine Kompression im Band, Band Gain wirkt weiter (am X32 "OFF"-LED)
+// Mix            = Dry ist die phasengleiche Summe der Baender (kein Kammfilter)
+//
+// Bedienung: Regler ziehen (hoch/runter), Shift/Strg = fein, Doppelklick = Default,
+// Mausrad = in Schritten. Regler sind als Slider versteckt (automatisierbar, Presets).
+
+slider1:mix=100<0,100,2>-Mix [%]
+slider2:att=10<0,19,1>-Attack
+slider3:rel_ms=200<20,3000,1:log>-Release [ms]
+slider4:autorel=0<0,1,1{Off,On}>-Auto Release
+slider5:xover=0<-50,50,2>-X-Over
+slider6:slope=0<0,1,1{12 dB/oct,48 dB/oct}>-Slope
+slider7:ratio_i=5<0,13,1{1.1,1.2,1.3,1.5,1.7,2,2.5,3,3.5,4,5,7,10,Limit}>-Ratio
+slider8:thr=-10<-40,0,0.5>-Threshold [dB]
+slider9:gain=0<-10,10,0.5>-Gain [dB]
+slider10:bt0=0<-10,10,0.5>-LOW Thr [dB]
+slider11:bg0=0<-10,10,0.5>-LOW Gain [dB]
+slider12:bl0=0<0,1,1{Off,On}>-LOW Lock
+slider13:bt1=0<-10,10,0.5>-LO-MID Thr [dB]
+slider14:bg1=0<-10,10,0.5>-LO-MID Gain [dB]
+slider15:bl1=0<0,1,1{Off,On}>-LO-MID Lock
+slider16:bt2=0<-10,10,0.5>-MID Thr [dB]
+slider17:bg2=0<-10,10,0.5>-MID Gain [dB]
+slider18:bl2=0<0,1,1{Off,On}>-MID Lock
+slider19:bt3=0<-10,10,0.5>-HI-MID Thr [dB]
+slider20:bg3=0<-10,10,0.5>-HI-MID Gain [dB]
+slider21:bl3=0<0,1,1{Off,On}>-HI-MID Lock
+slider22:bt4=0<-10,10,0.5>-HIGH Thr [dB]
+slider23:bg4=0<-10,10,0.5>-HIGH Gain [dB]
+slider24:bl4=0<0,1,1{Off,On}>-HIGH Lock
+slider25:solo=0<0,5,1{Off,LOW,LO-MID,MID,HI-MID,HIGH}>-Band Solo
+slider26:active=1<0,1,1{Off,On}>-Active
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+// ---- Speicher-Layout ----
+LPC = 1000;  // Lowpass-Koeffizienten   [node*4+sec]*5
+HPC = 1100;  // Highpass-Koeffizienten
+APC = 1200;  // Allpass-Koeffizienten   [node*2+sec]*5
+ST  = 1300;  // Filterzustaende, 128 pro Kanal
+BL  = 1600;  BR = 1610;      // Bandsignale L/R
+GRF = 1620;  GRS = 1630;     // Gain-Reduction schnell / langsam (dB)
+GRD = 1640;                  // GR fuer Anzeige
+BTH = 1650;  BGN = 1660;  BLK = 1670;
+FX  = 1680;                  // aktuelle Trennfrequenzen
+RAT = 1690;                  // Ratio-Tabelle
+BASE = 1710;                 // Grund-Trennfrequenzen (geschaetzt)
+
+RAT[0]=1.1; RAT[1]=1.2; RAT[2]=1.3; RAT[3]=1.5; RAT[4]=1.7; RAT[5]=2;
+RAT[6]=2.5; RAT[7]=3; RAT[8]=3.5; RAT[9]=4; RAT[10]=5; RAT[11]=7; RAT[12]=10; RAT[13]=1000;
+
+BASE[0]=100; BASE[1]=300; BASE[2]=1300; BASE[3]=4500;
+
+kw = 4; kw2 = kw/2;   // weiches Knie, 4 dB
+lastslope = -1;
+
+// ---- Biquad (TDF2): c = Koeffizienten b0 b1 b2 a1 a2, s = 2 Zustaende ----
+function bq(c, s, x) local(y)
+(
+  y = c[0]*x + s[0];
+  s[0] = c[1]*x - c[3]*y + s[1];
+  s[1] = c[2]*x - c[4]*y;
+  y;
+);
+
+function set_rbj(c, type, f, q) local(w, cs, sn, al, a0)
+(
+  w = 2*$pi*f/srate; cs = cos(w); sn = sin(w); al = sn/(2*q); a0 = 1 + al;
+  type == 0 ? (          // Lowpass
+    c[0] = (1-cs)/2/a0; c[1] = (1-cs)/a0; c[2] = c[0];
+  ) : type == 1 ? (      // Highpass
+    c[0] = (1+cs)/2/a0; c[1] = -(1+cs)/a0; c[2] = c[0];
+  ) : (                  // Allpass
+    c[0] = (1-al)/a0; c[1] = -2*cs/a0; c[2] = 1;
+  );
+  c[3] = -2*cs/a0; c[4] = (1-al)/a0;
+);
+
+function set_1p(c, type, f) local(k, a)
+(
+  k = tan($pi*f/srate); a = (k-1)/(k+1);
+  type == 0 ? ( c[0] = k/(k+1); c[1] = c[0]; ) :
+  type == 1 ? ( c[0] = 1/(k+1); c[1] = -c[0]; ) :
+              ( c[0] = a; c[1] = 1; );
+  c[2] = 0; c[3] = a; c[4] = 0;
+);
+
+function lpchain(k, so, x) local(j)
+( j = 0; loop(nsec, x = bq(LPC+(k*4+j)*5, so+(k*4+j)*2, x); j += 1; ); x; );
+
+function hpchain(k, so, x) local(j)
+( j = 0; loop(nsec, x = bq(HPC+(k*4+j)*5, so+32+(k*4+j)*2, x); j += 1; ); x; );
+
+// Allpass-Kompensation: Knoten k, Instanz m
+function apchain(k, m, so, x) local(j)
+( j = 0; loop(nap, x = bq(APC+(k*2+j)*5, so+64+(m*2+j)*2, x); j += 1; ); x; );
+
+// Linkwitz-Riley-Baum: 4 Trennstellen -> 5 phasengleiche Baender
+function split(so, x, out) local(h)
+(
+  out[0] = lpchain(0, so, x); h = hpchain(0, so, x)*sgn;
+  out[1] = lpchain(1, so, h); h = hpchain(1, so, h)*sgn;
+  out[2] = lpchain(2, so, h); h = hpchain(2, so, h)*sgn;
+  out[3] = lpchain(3, so, h); out[4] = hpchain(3, so, h)*sgn;
+  out[0] = apchain(3, 2, so, apchain(2, 1, so, apchain(1, 0, so, out[0])));
+  out[1] = apchain(3, 4, so, apchain(2, 3, so, out[1]));
+  out[2] = apchain(3, 5, so, out[2]);
+);
+
+function update_filters() local(k, f, sh)
+(
+  sh = 2^(xover/50);                    // +-50 = +-1 Oktave (geschaetzt)
+  k = 0;
+  loop(4,
+    f = min(BASE[k]*sh, srate*0.45);
+    FX[k] = f;
+    slope ? (
+      // LR8 = Butterworth 4. Ordnung zweimal
+      set_rbj(LPC+(k*4+0)*5, 0, f, 0.5411961); set_rbj(LPC+(k*4+1)*5, 0, f, 1.3065630);
+      set_rbj(LPC+(k*4+2)*5, 0, f, 0.5411961); set_rbj(LPC+(k*4+3)*5, 0, f, 1.3065630);
+      set_rbj(HPC+(k*4+0)*5, 1, f, 0.5411961); set_rbj(HPC+(k*4+1)*5, 1, f, 1.3065630);
+      set_rbj(HPC+(k*4+2)*5, 1, f, 0.5411961); set_rbj(HPC+(k*4+3)*5, 1, f, 1.3065630);
+      set_rbj(APC+(k*2+0)*5, 2, f, 0.5411961); set_rbj(APC+(k*2+1)*5, 2, f, 1.3065630);
+    ) : (
+      // LR2 = Butterworth 1. Ordnung zweimal, HP invertiert
+      set_1p(LPC+(k*4+0)*5, 0, f); set_1p(LPC+(k*4+1)*5, 0, f);
+      set_1p(HPC+(k*4+0)*5, 1, f); set_1p(HPC+(k*4+1)*5, 1, f);
+      set_1p(APC+(k*2+0)*5, 2, f);
+    );
+    k += 1;
+  );
+  nsec = slope ? 4 : 2;
+  nap  = slope ? 2 : 1;
+  sgn  = slope ? 1 : -1;
+);
+
+function tc(ms) ( 1 - exp(-1/(max(ms,0.01)*0.001*srate)) );
+
+function recalc()
+(
+  slope != lastslope ? ( memset(ST, 0, 256); lastslope = slope; );
+  update_filters();
+  BTH[0]=bt0; BTH[1]=bt1; BTH[2]=bt2; BTH[3]=bt3; BTH[4]=bt4;
+  BGN[0]=bg0; BGN[1]=bg1; BGN[2]=bg2; BGN[3]=bg3; BGN[4]=bg4;
+  BLK[0]=bl0; BLK[1]=bl1; BLK[2]=bl2; BLK[3]=bl3; BLK[4]=bl4;
+  slopeR = 1 - 1/RAT[ratio_i];
+  mixf = mix/100;
+  att_ms = 100 * (0.5/100)^(att/19);    // Attack 0..19 -> 100 ms .. 0.5 ms (geschaetzt)
+  ac  = tc(att_ms);
+  rc  = tc(autorel ? 50 : rel_ms);
+  acs = tc(400);
+  rcs = tc(1500);
+);
+
+// ================= UI: Control-Tabelle =================
+// Feld: 0 slider, 1 x, 2 y, 3 r, 4 min, 5 max, 6 step, 7 default/solo-wert,
+//       8 kurve (0 lin, 1 log, 2 ratio), 9 art (0 knob, 1 toggle, 2 solo), 10 w, 11 h
+CT = 3000; NCT = 30;
+function defknob(id, sl, x, y, r, mn, mx, st, df, cv, lbl) local(p)
+( p = CT + id*12; p[0]=sl; p[1]=x; p[2]=y; p[3]=r; p[4]=mn; p[5]=mx; p[6]=st; p[7]=df; p[8]=cv; p[9]=0;
+  strcpy(id, lbl); );
+function defbtn(id, sl, x, y, w, h, kind, val, lbl) local(p)
+( p = CT + id*12; p[0]=sl; p[1]=x; p[2]=y; p[10]=w; p[11]=h; p[9]=kind; p[7]=val; p[4]=0; p[5]=1;
+  strcpy(id, lbl); );
+
+KY = 78; KR = 22;
+defknob(0, 1,   60, KY, KR,   0,  100, 2,   100, 0, "MIX");
+defknob(1, 2,  155, KY, KR,   0,   19, 1,    10, 0, "ATT");
+defknob(2, 3,  250, KY, KR,  20, 3000, 1,   200, 1, "REL");
+defknob(3, 5,  345, KY, KR, -50,   50, 2,     0, 0, "X-OVER");
+defknob(4, 7,  440, KY, KR,   0,   13, 1,     5, 2, "RATIO");
+defknob(5, 8,  560, KY, KR, -40,    0, 0.5, -10, 0, "THRESH");
+defknob(6, 9,  655, KY, KR, -10,   10, 0.5,   0, 0, "GAIN");
+defbtn(7, 4,  745, 40, 140, 24, 1, 0, "AUTO REL");
+defbtn(8, 6,  745, 70, 140, 24, 1, 0, "48 dB/oct");
+defbtn(9, 26, 745, 100, 140, 24, 1, 0, "ACTIVE");
+
+BW = 176; BX0 = 10; BKY = 222; BKR = 20;
+bb = 0;
+loop(5,
+  bx = BX0 + bb*BW;
+  defknob(10+bb*4, 10+bb*3, bx+38,  BKY, BKR, -10, 10, 0.5, 0, 0, "THR");
+  defknob(11+bb*4, 11+bb*3, bx+100, BKY, BKR, -10, 10, 0.5, 0, 0, "GAIN");
+  defbtn (12+bb*4, 12+bb*3, bx+10, 290, 58, 22, 1, 0,    "LOCK");
+  defbtn (13+bb*4, 25,      bx+74, 290, 58, 22, 2, bb+1, "SOLO");
+  bb += 1;
+);
+strcpy(40, "LOW"); strcpy(41, "LO-MID"); strcpy(42, "MID"); strcpy(43, "HI-MID"); strcpy(44, "HIGH");
+
+function bandcol(n, br)
+(
+  n == 0 ? (gfx_r=0.95; gfx_g=0.45; gfx_b=0.45;) :
+  n == 1 ? (gfx_r=0.95; gfx_g=0.72; gfx_b=0.45;) :
+  n == 2 ? (gfx_r=0.90; gfx_g=0.60; gfx_b=0.88;) :
+  n == 3 ? (gfx_r=0.70; gfx_g=0.65; gfx_b=0.97;) :
+           (gfx_r=0.20; gfx_g=0.78; gfx_b=0.72;);
+  gfx_r *= br; gfx_g *= br; gfx_b *= br;
+);
+
+function ctext(str, cx, y) local(w, h)
+( gfx_measurestr(str, w, h); gfx_x = cx - w/2; gfx_y = y; gfx_drawstr(str); );
+
+function get_norm(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  p[8] == 1 ? log(v/p[4])/log(p[5]/p[4]) : (v - p[4])/(p[5] - p[4]);
+);
+
+function set_val(id, v) local(p)
+(
+  p = CT + id*12;
+  v != slider(p[0]) ? (
+    slider(p[0]) = v;
+    slider_automate(2^(p[0]-1));
+    need_recalc = 1;
+  );
+);
+
+function set_norm(id, n) local(p, v)
+(
+  p = CT + id*12; n = max(0, min(1, n));
+  v = p[8] == 1 ? p[4]*(p[5]/p[4])^n : p[4] + n*(p[5] - p[4]);
+  v = p[4] + floor((v - p[4])/p[6] + 0.5)*p[6];
+  set_val(id, max(p[4], min(p[5], v)));
+);
+
+function wheel(id, dir) local(p, v)
+(
+  p = CT + id*12;
+  (p[5] - p[4])/p[6] <= 60 ? (
+    v = slider(p[0]) + dir*p[6];
+    set_val(id, max(p[4], min(p[5], v)));
+  ) : set_norm(id, get_norm(id) + dir*0.02);
+);
+
+function hit(mx, my) local(id, p, r, found)
+(
+  found = -1; id = 0;
+  loop(NCT,
+    p = CT + id*12;
+    p[9] == 0 ? (
+      r = p[3] + 6;
+      sqr(mx - p[1]) + sqr(my - p[2]) <= r*r ? found = id;
+    ) : (
+      mx >= p[1] && mx <= p[1]+p[10] && my >= p[2] && my <= p[2]+p[11] ? found = id;
+    );
+    id += 1;
+  );
+  found;
+);
+
+function fmtval(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  id == 0 ? sprintf(#ui_v, "%d %%", v) :
+  id == 1 ? sprintf(#ui_v, "%d", v) :
+  id == 2 ? ( autorel ? strcpy(#ui_v, "AUTO") : v >= 1000 ? sprintf(#ui_v, "%.2f s", v/1000) : sprintf(#ui_v, "%d ms", v) ) :
+  id == 3 ? sprintf(#ui_v, "%+d", v) :
+  id == 4 ? ( v >= 13 ? strcpy(#ui_v, "LIMIT") : sprintf(#ui_v, "%.1f:1", RAT[v]) ) :
+  id == 5 ? sprintf(#ui_v, "%.1f dB", v) :
+            sprintf(#ui_v, "%+.1f dB", v);
+);
+
+function draw_knob(id) local(p, cx, cy, r, n, z, a, az, rr, dim)
+(
+  p = CT + id*12; cx = p[1]; cy = p[2]; r = p[3];
+  n = get_norm(id);
+  z = (p[4] < 0 && p[5] > 0) ? (0 - p[4])/(p[5] - p[4]) : 0;
+  a  = -2.356 + 4.712*n;
+  az = -2.356 + 4.712*z;
+  dim = (id == 2 && autorel) ? 0.4 : 1;
+  // Skalenpunkte
+  gfx_r = gfx_g = gfx_b = 0.55; gfx_a = 1;
+  rr = 0;
+  loop(11,
+    gfx_circle(cx + sin(-2.356 + 4.712*rr/10)*(r+9), cy - cos(-2.356 + 4.712*rr/10)*(r+9), 1, 1, 1);
+    rr += 1;
+  );
+  // Spur + Wertbogen
+  gfx_r = gfx_g = gfx_b = 0.25;
+  rr = r + 3; loop(3, gfx_arc(cx, cy, rr, -2.356, 2.356, 1); rr += 1; );
+  gfx_r = 0.35*dim; gfx_g = 0.75*dim; gfx_b = 1.0*dim;
+  rr = r + 3; loop(3, gfx_arc(cx, cy, rr, min(a, az), max(a, az), 1); rr += 1; );
+  // Knopf
+  gfx_r = gfx_g = gfx_b = 0.06; gfx_circle(cx, cy, r, 1, 1);
+  gfx_r = gfx_g = gfx_b = 0.30; gfx_circle(cx, cy, r, 0, 1);
+  gfx_r = gfx_g = gfx_b = 0.95*dim;
+  gfx_line(cx + sin(a)*r*0.25, cy - cos(a)*r*0.25, cx + sin(a)*r*0.92, cy - cos(a)*r*0.92, 1);
+  gfx_line(cx + sin(a)*r*0.25 + 1, cy - cos(a)*r*0.25, cx + sin(a)*r*0.92 + 1, cy - cos(a)*r*0.92, 1);
+  // Beschriftung
+  gfx_setfont(2);
+  gfx_r = gfx_g = gfx_b = 0.85; ctext(id, cx, cy + r + 12);
+  gfx_setfont(1);
+  gfx_r = 0.45; gfx_g = 0.75; gfx_b = 1.0; fmtval(id); ctext(#ui_v, cx, cy + r + 27);
+);
+
+function draw_btn(id) local(p, on, x, y, w, h)
+(
+  p = CT + id*12; x = p[1]; y = p[2]; w = p[10]; h = p[11];
+  on = p[9] == 2 ? (solo == p[7]) : (slider(p[0]) != 0);
+  gfx_r = gfx_g = gfx_b = 0.14; gfx_rect(x, y, w, h);
+  gfx_r = gfx_g = gfx_b = 0.35; gfx_roundrect(x, y, w-1, h-1, 3, 1);
+  // LED
+  on ? (
+    p[9] == 2 ? (gfx_r=1; gfx_g=0.75; gfx_b=0.15;) :
+    id == 9   ? (gfx_r=0.3; gfx_g=0.9; gfx_b=0.4;) : (gfx_r=0.2; gfx_g=0.85; gfx_b=1;);
+  ) : (gfx_r = gfx_g = gfx_b = 0.22;);
+  gfx_rect(x + 6, y + h/2 - 4, 14, 8);
+  gfx_setfont(1);
+  gfx_r = gfx_g = gfx_b = on ? 0.95 : 0.65;
+  gfx_x = x + 27; gfx_y = y + h/2 - 6; gfx_drawstr(id);
+);
+
+@slider
+recalc();
+
+@block
+need_recalc ? ( need_recalc = 0; recalc(); );
+
+@sample
+active ? (
+  split(ST,       spl0, BL);
+  split(ST + 128, spl1, BR);
+  wl = wr = dl = dr = 0;
+  s_b = 0;
+  loop(5,
+    lvl = max(abs(BL[s_b]), abs(BR[s_b]));
+    ldb = lvl > 0.0000001 ? 8.685889638*log(lvl) : -140;
+    over = ldb - (thr + BTH[s_b]);
+    grt = over <= -kw2 ? 0 : over >= kw2 ? over*slopeR : slopeR*sqr(over + kw2)/(2*kw);
+    BLK[s_b] ? grt = 0;
+
+    gf = GRF[s_b]; gf += (grt - gf)*(grt > gf ? ac : rc); GRF[s_b] = gf;
+    autorel ? (
+      gs = GRS[s_b]; gs += (grt - gs)*(grt > gs ? acs : rcs); GRS[s_b] = gs;
+      g = max(gf, gs);
+    ) : g = gf;
+    GRD[s_b] = max(GRD[s_b], g);
+
+    gl = exp((gain + BGN[s_b] - g)*0.1151292546);
+    (solo == 0 || solo == s_b+1) ? (
+      wl += BL[s_b]*gl; wr += BR[s_b]*gl;
+      dl += BL[s_b];    dr += BR[s_b];
+    );
+    s_b += 1;
+  );
+  spl0 = dl + (wl - dl)*mixf;
+  spl1 = dr + (wr - dr)*mixf;
+
+  // Schutz: NaN/Inf oder > +24 dBFS -> Filter zuruecksetzen, Stille ausgeben
+  (spl0 != spl0 || spl1 != spl1 || abs(spl0) > 16 || abs(spl1) > 16) ? (
+    memset(ST, 0, 256); memset(GRF, 0, 30);
+    spl0 = spl1 = 0;
+  );
+);
+
+@gfx 890 380
+// Nur ui_*-Variablen und lokale Funktionsvariablen: @gfx laeuft in einem anderen Thread.
+gfx_setfont(1, "Arial", 13);
+gfx_setfont(2, "Arial", 13, 'b');
+gfx_setfont(3, "Arial", 20, 'b');
+
+// ---------- Maus ----------
+ui_md = mouse_cap & 1;
+ui_md && !ui_last ? (
+  ui_h = hit(mouse_x, mouse_y);
+  ui_h >= 0 ? (
+    CT[ui_h*12 + 9] == 0 ? (
+      ui_now = time_precise();
+      (ui_now - ui_tclick < 0.3 && ui_lastid == ui_h) ? (
+        set_val(ui_h, CT[ui_h*12 + 7]); ui_drag = -1;
+      ) : (
+        ui_drag = ui_h; ui_y0 = mouse_y; ui_n0 = get_norm(ui_h);
+      );
+      ui_tclick = ui_now; ui_lastid = ui_h;
+    ) : (
+      CT[ui_h*12 + 9] == 2 ? set_val(ui_h, solo == CT[ui_h*12 + 7] ? 0 : CT[ui_h*12 + 7])
+                           : set_val(ui_h, slider(CT[ui_h*12]) ? 0 : 1);
+      ui_drag = -1;
+    );
+  ) : ui_drag = -1;
+);
+ui_md && ui_drag >= 0 ? (
+  ui_sens = (mouse_cap & 12) ? 900 : 180;
+  set_norm(ui_drag, ui_n0 + (ui_y0 - mouse_y)/ui_sens);
+);
+!ui_md ? ui_drag = -1;
+ui_last = ui_md;
+mouse_wheel != 0 ? (
+  ui_h = hit(mouse_x, mouse_y);
+  (ui_h >= 0 && CT[ui_h*12 + 9] == 0) ? wheel(ui_h, mouse_wheel > 0 ? 1 : -1);
+  mouse_wheel = 0;
+);
+
+// ---------- Hintergrund / Rack ----------
+gfx_a = 1;
+gfx_r = gfx_g = gfx_b = 0.82; gfx_rect(0, 0, gfx_w, gfx_h);          // Rack-Blende
+gfx_r = gfx_g = gfx_b = 0.13; gfx_rect(6, 4, 880, 372);               // Panel
+
+gfx_setfont(3); gfx_r = gfx_g = gfx_b = 0.92;
+gfx_x = 16; gfx_y = 10; gfx_drawstr("COMBINATOR");
+gfx_setfont(1); gfx_r = 0.35; gfx_g = 0.6; gfx_b = 0.95;
+gfx_x = 160; gfx_y = 16; gfx_drawstr("5-BAND MULTIBAND COMPRESSOR");
+!active ? (gfx_setfont(2); gfx_r = 1; gfx_g = 0.35; gfx_b = 0.3; gfx_x = 400; gfx_y = 16; gfx_drawstr("BYPASS"));
+
+// Trenner zwischen globaler Sektion und Baendern
+gfx_r = gfx_g = gfx_b = 0.30;
+gfx_line(10, 142, 880, 142);
+gfx_line(720, 34, 720, 134);
+
+ui_i = 0; loop(7, draw_knob(ui_i); ui_i += 1; );
+ui_i = 7; loop(3, draw_btn(ui_i);  ui_i += 1; );
+
+// ---------- Bandbloecke ----------
+ui_b = 0;
+loop(5,
+  ui_bx = BX0 + ui_b*BW;
+  ui_off = BLK[ui_b] || (solo && solo != ui_b + 1);
+
+  // Kopfzeile in Bandfarbe
+  bandcol(ui_b, ui_off ? 0.45 : 1);
+  gfx_rect(ui_bx + 4, 150, BW - 8, 20);
+  gfx_setfont(2); gfx_r = gfx_g = gfx_b = 0.08;
+  ctext(40 + ui_b, ui_bx + BW/2, 154);
+
+  draw_knob(10 + ui_b*4);
+  draw_knob(11 + ui_b*4);
+  draw_btn (12 + ui_b*4);
+  draw_btn (13 + ui_b*4);
+
+  // GR-Meter 0 .. -12 dB
+  ui_mx = ui_bx + 140; ui_my = 182; ui_mh = 130;
+  gfx_r = gfx_g = gfx_b = 0.07; gfx_rect(ui_mx, ui_my, 22, ui_mh);
+  ui_v = GRD[ui_b]; GRD[ui_b] = ui_v*0.85;
+  ui_v = min(max(ui_v, 0), 12);
+  bandcol(ui_b, 1);
+  ui_v > 0.05 ? gfx_rect(ui_mx + 2, ui_my, 18, ui_v/12*ui_mh);
+  gfx_r = gfx_g = gfx_b = 0.30;
+  ui_d = 0; loop(5, gfx_line(ui_mx - 3, ui_my + ui_d/12*ui_mh, ui_mx - 1, ui_my + ui_d/12*ui_mh); ui_d += 3; );
+  gfx_setfont(1); gfx_r = gfx_g = gfx_b = 0.75;
+  sprintf(#ui_gr, "%.1f", -ui_v); ctext(#ui_gr, ui_mx + 11, ui_my + ui_mh + 4);
+
+  // Trenner
+  ui_b > 0 ? (
+    gfx_r = gfx_g = gfx_b = 0.32;
+    gfx_line(ui_bx, 150, ui_bx, 330);
+  );
+  // Frequenzleiste unten
+  bandcol(ui_b, ui_off ? 0.45 : 0.9);
+  gfx_rect(ui_bx + 4, 338, BW - 8, 8);
+  ui_b += 1;
+);
+
+// Trennfrequenzen an den Trennern
+gfx_setfont(1); gfx_r = gfx_g = gfx_b = 0.8;
+ui_k = 0;
+loop(4,
+  FX[ui_k] >= 1000 ? sprintf(#ui_f, "%.1f kHz", FX[ui_k]/1000) : sprintf(#ui_f, "%d Hz", FX[ui_k]);
+  ctext(#ui_f, BX0 + (ui_k + 1)*BW, 352);
+  ui_k += 1;
+);

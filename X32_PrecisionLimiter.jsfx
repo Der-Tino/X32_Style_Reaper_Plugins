@@ -1,0 +1,304 @@
+desc:X32-style Precision Limiter
+// Nachbau der Bedienlogik des X32/M32 "Precision Limiter" fuer Offline-Uebung in REAPER.
+// Kein Klon des Original-DSP. Squeeze und Autogain sind Annaeherungen.
+//
+// Prinzip wie am X32: kein Threshold-Regler. Die Decke liegt intern bei 0 dBFS,
+// INPUT GAIN fahrt das Signal in die Decke, OUTPUT GAIN setzt danach die maximale Ausgangslautstaerke.
+// Lookahead 1.5 ms (wird von REAPER per PDC ausgeglichen), danach harte Sicherung auf die Decke.
+//
+// Bedienung: Fader ziehen, Shift/Strg = fein, Doppelklick = Default, Mausrad = Schritte.
+
+slider1:in_db=0<0,18,0.5>-Input Gain [dB]
+slider2:out_db=-0.5<-18,0,0.5>-Output Gain [dB]
+slider3:squeeze=0<0,100,2>-Squeeze [%]
+slider4:knee=5<0,10,1>-Knee [dB]
+slider5:att_ms=0.25<0.05,1,0.01:log>-Attack [ms]
+slider6:rel_ms=200<20,2000,1:log>-Release [ms]
+slider7:link=1<0,1,1{Off,On}>-Stereo Link
+slider8:autogain=0<0,1,1{Off,On}>-Autogain
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+DLL = 10000; DLR = 12000; HBL = 14000; HBR = 16000;   // Delay- und Gain-Puffer
+MIN = 20000; MGR = 20001; MOUT = 20002;                // Meter (Peak, linear bzw. dB)
+
+N = ceil(0.0015*srate);  SZ = N + 1;
+pdc_delay = N; pdc_bot_ch = 0; pdc_top_ch = 2;
+memset(DLL, 0, SZ); memset(DLR, 0, SZ);
+ii = 0; loop(SZ, HBL[ii] = 1; HBR[ii] = 1; ii += 1; );
+pos = 0; e0 = e1 = 1; agp = 0; agdb = 0; sqe = 0;
+
+function tc(ms) ( 1 - exp(-1/(max(ms, 0.001)*0.001*srate)) );
+
+// Benoetigter Gain fuer Decke 0 dBFS mit weichem Knie (Kniebreite = knee dB, endet bei 0 dBFS)
+function greq(a) local(L, o)
+(
+  a < 0.000001 ? 1 : (
+    W <= 0 ? ( a > 1 ? 1/a : 1 ) : (
+      L = 20*log10(a);
+      L < -W ? 1 : (
+        o = L <= W ? L - sqr(L + W)/(4*W) : 0;
+        10^((o - L)/20);
+      );
+    );
+  );
+);
+
+function softsat(x) ( x/sqrt(1 + x*x) );
+
+function recalc()
+(
+  ing  = 10^(in_db/20);
+  outg = 10^(out_db/20);
+  W    = knee/2;
+  ca   = tc(att_ms);
+  cr   = tc(rel_ms);
+  sq   = squeeze/100;
+  sratio = 1 + 2*sq;
+  c_sq = tc(15);
+  c_agr = tc(1000);
+  c_ag  = tc(3000);
+);
+
+// ================= UI =================
+CT = 30000; NCT = 8;
+// 0 slider, 1 x, 2 ytop, 3 h, 4 min, 5 max, 6 step, 7 def, 8 kurve, 9 art (0 fader, 1 toggle), 10 w, 11 hh
+function deffader(id, sl, x, y, h, mn, mx, st, df, cv, lbl) local(p)
+( p = CT + id*12; p[0]=sl; p[1]=x; p[2]=y; p[3]=h; p[4]=mn; p[5]=mx; p[6]=st; p[7]=df; p[8]=cv; p[9]=0;
+  strcpy(id, lbl); );
+function defbtn(id, sl, x, y, w, h, lbl) local(p)
+( p = CT + id*12; p[0]=sl; p[1]=x; p[2]=y; p[10]=w; p[11]=h; p[9]=1; p[4]=0; p[5]=1; p[7]=0;
+  strcpy(id, lbl); );
+
+FY = 48; FH = 170;
+deffader(0, 1, 300, FY, FH,    0,   18, 0.5,     0, 0, "INPUT GAIN");
+deffader(1, 2, 410, FY, FH,  -18,    0, 0.5,  -0.5, 0, "OUTPUT GAIN");
+deffader(2, 3, 555, FY, FH,    0,  100, 2,       0, 0, "SQUEEZE");
+deffader(3, 4, 660, FY, FH,    0,   10, 1,       5, 0, "KNEE");
+deffader(4, 5, 765, FY, FH, 0.05,    1, 0.01, 0.25, 1, "ATTACK");
+deffader(5, 6, 870, FY, FH,   20, 2000, 1,     200, 1, "RELEASE");
+defbtn  (6, 7, 140, 62, 120, 56, "STEREO LINK");
+defbtn  (7, 8, 140, 150, 120, 56, "AUTOGAIN");
+
+function ctext(str, cx, y) local(w, h)
+( gfx_measurestr(str, w, h); gfx_x = cx - w/2; gfx_y = y; gfx_drawstr(str); );
+
+function get_norm(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  p[8] == 1 ? log(v/p[4])/log(p[5]/p[4]) : (v - p[4])/(p[5] - p[4]);
+);
+function set_val(id, v) local(p)
+(
+  p = CT + id*12;
+  v != slider(p[0]) ? ( slider(p[0]) = v; slider_automate(2^(p[0]-1)); need_recalc = 1; );
+);
+function set_norm(id, n) local(p, v)
+(
+  p = CT + id*12; n = max(0, min(1, n));
+  v = p[8] == 1 ? p[4]*(p[5]/p[4])^n : p[4] + n*(p[5] - p[4]);
+  v = p[4] + floor((v - p[4])/p[6] + 0.5)*p[6];
+  set_val(id, max(p[4], min(p[5], v)));
+);
+function wheel(id, dir) local(p)
+(
+  p = CT + id*12;
+  (p[5] - p[4])/p[6] <= 60 ? set_val(id, max(p[4], min(p[5], slider(p[0]) + dir*p[6])))
+                           : set_norm(id, get_norm(id) + dir*0.02);
+);
+function hit(mx, my) local(id, p, found)
+(
+  found = -1; id = 0;
+  loop(NCT,
+    p = CT + id*12;
+    p[9] == 0 ? (
+      abs(mx - p[1]) <= 24 && my >= p[2] - 16 && my <= p[2] + p[3] + 16 ? found = id;
+    ) : (
+      mx >= p[1] && mx <= p[1] + p[10] && my >= p[2] && my <= p[2] + p[11] ? found = id;
+    );
+    id += 1;
+  );
+  found;
+);
+function fmtval(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  id == 0 ? sprintf(#ui_v, "+%.1f dB", v) :
+  id == 1 ? sprintf(#ui_v, "%.1f dB", v) :
+  id == 2 ? sprintf(#ui_v, "%d %%", v) :
+  id == 3 ? sprintf(#ui_v, "%d dB", v) :
+  id == 4 ? sprintf(#ui_v, "%.2f ms", v) :
+            ( v >= 1000 ? sprintf(#ui_v, "%.2f s", v/1000) : sprintf(#ui_v, "%d ms", v) );
+);
+function draw_fader(id) local(p, x, y, h, n, cy)
+(
+  p = CT + id*12; x = p[1]; y = p[2]; h = p[3];
+  n = get_norm(id);
+  // Gehaeuse + Schlitz
+  gfx_r = gfx_g = gfx_b = 0.30; gfx_rect(x - 24, y - 16, 48, h + 32);
+  gfx_r = gfx_g = gfx_b = 0.18; gfx_roundrect(x - 24, y - 16, 47, h + 31, 6, 1);
+  gfx_r = gfx_g = gfx_b = 0.08; gfx_rect(x - 3, y - 4, 6, h + 8);
+  // Kappe
+  cy = y + (1 - n)*h;
+  gfx_r = gfx_g = gfx_b = 0.55; gfx_rect(x - 15, cy - 15, 30, 30);
+  gfx_r = gfx_g = gfx_b = 0.95; gfx_rect(x - 14, cy - 14, 28, 13);
+  gfx_r = gfx_g = gfx_b = 0.80; gfx_rect(x - 14, cy + 1, 28, 13);
+  gfx_r = gfx_g = gfx_b = 0.25; gfx_line(x - 14, cy, x + 13, cy);
+  // Beschriftung
+  gfx_setfont(2); gfx_r = gfx_g = gfx_b = 0.08; ctext(id, x, y + h + 24);
+  gfx_setfont(1); gfx_r = 0.10; gfx_g = 0.25; gfx_b = 0.55; fmtval(id); ctext(#ui_v, x, y + h + 40);
+);
+function draw_btn(id) local(p, x, y, on, lx)
+(
+  p = CT + id*12; x = p[1]; y = p[2];
+  on = slider(p[0]) != 0;
+  lx = x + p[10]/2 - 13;
+  gfx_r = gfx_g = gfx_b = 0.25; gfx_rect(lx - 2, y - 2, 30, 30);
+  on ? (gfx_r = 0.55; gfx_g = 0.85; gfx_b = 0.20;) : (gfx_r = gfx_g = gfx_b = 0.62;);
+  gfx_rect(lx, y, 26, 26);
+  gfx_setfont(2); gfx_r = gfx_g = gfx_b = 0.08; ctext(id, x + p[10]/2, y + 34);
+);
+function draw_meter(x, y, h, v, lo, hi, gr, lbl) local(n, ty)
+(
+  gfx_r = gfx_g = gfx_b = 0.07; gfx_rect(x, y, 22, h);
+  gr ? (
+    n = min(max(v, 0), hi)/hi;
+    gfx_r = 1; gfx_g = 0.6; gfx_b = 0.15;
+    n > 0.003 ? gfx_rect(x + 2, y, 18, n*h);
+  ) : (
+    n = (min(max(v, lo), hi) - lo)/(hi - lo);
+    v > -0.1 ? (gfx_r = 1; gfx_g = 0.25; gfx_b = 0.2;) : (gfx_r = 0.3; gfx_g = 0.85; gfx_b = 0.4;);
+    n > 0.003 ? gfx_rect(x + 2, y + h - n*h, 18, n*h);
+    // 0-dBFS-Markierung
+    ty = y + h - (0 - lo)/(hi - lo)*h;
+    hi > 0 ? (gfx_r = gfx_g = gfx_b = 0.9; gfx_line(x - 3, ty, x + 24, ty));
+  );
+  gfx_setfont(1); gfx_r = gfx_g = gfx_b = 0.85; ctext(lbl, x + 11, y + h + 6);
+);
+
+recalc();
+
+@slider
+recalc();
+
+@block
+need_recalc ? ( need_recalc = 0; recalc(); );
+
+@sample
+x0 = spl0*ing; x1 = spl1*ing;
+
+// Autogain: langsame Pegelkorrektur Richtung ca. -16 dBFS RMS (-6 .. +12 dB)
+autogain ? (
+  agp += ((x0*x0 + x1*x1)*0.5 - agp)*c_agr;
+  agp > 0.00001 ? ( agt = max(-6, min(12, -16 - 10*log10(agp))); agdb += (agt - agdb)*c_ag; );
+  agl = 10^(agdb/20); x0 *= agl; x1 *= agl;
+) : ( agdb = 0; agp = 0; );
+
+// Squeeze: RMS-Kompression + bis +5 dB Drive + leichte Saettigung
+sq > 0 ? (
+  sqe += (max(x0*x0, x1*x1) - sqe)*c_sq;
+  sdb = 10*log10(sqe + 0.000000000001);
+  sgr = sdb > -18 ? (sdb + 18)*(1 - 1/sratio) : 0;
+  sgl = 10^((sq*5 - sgr)/20);
+  x0 *= sgl; x1 *= sgl;
+  x0 += (softsat(x0) - x0)*sq*0.3;
+  x1 += (softsat(x1) - x1)*sq*0.3;
+);
+
+MIN[0] = max(MIN[0], max(abs(x0), abs(x1)));
+
+// Limiter mit Lookahead
+gq0 = greq(abs(x0)); gq1 = greq(abs(x1));
+link ? ( gq0 = gq1 = min(gq0, gq1); );
+DLL[pos] = x0; DLR[pos] = x1; HBL[pos] = gq0; HBR[pos] = gq1;
+
+m0 = 1; m1 = 1; jj = 0;
+loop(SZ, m0 = min(m0, HBL[jj]); m1 = min(m1, HBR[jj]); jj += 1; );
+e0 += (m0 - e0)*(m0 < e0 ? ca : cr);
+e1 += (m1 - e1)*(m1 < e1 ? ca : cr);
+
+old = pos + 1; old >= SZ ? old = 0;
+g0 = min(e0, HBL[old]); g1 = min(e1, HBR[old]);
+link ? ( g0 = g1 = min(g0, g1); );
+
+y0 = max(-1, min(1, DLL[old]*g0));
+y1 = max(-1, min(1, DLR[old]*g1));
+spl0 = y0*outg; spl1 = y1*outg;
+
+pos += 1; pos >= SZ ? pos = 0;
+
+MGR[0]  = max(MGR[0], -20*log10(max(min(g0, g1), 0.000001)));
+MOUT[0] = max(MOUT[0], max(abs(spl0), abs(spl1)));
+
+@gfx 1090 300
+gfx_setfont(1, "Arial", 13);
+gfx_setfont(2, "Arial", 13, 'b');
+gfx_setfont(3, "Arial", 17, 'b');
+
+// ---------- Maus ----------
+ui_md = mouse_cap & 1;
+ui_md && !ui_last ? (
+  ui_h = hit(mouse_x, mouse_y);
+  ui_h >= 0 ? (
+    CT[ui_h*12 + 9] == 0 ? (
+      ui_now = time_precise();
+      (ui_now - ui_tclick < 0.3 && ui_lastid == ui_h) ? (
+        set_val(ui_h, CT[ui_h*12 + 7]); ui_drag = -1;
+      ) : (
+        ui_drag = ui_h; ui_y0 = mouse_y; ui_n0 = get_norm(ui_h);
+      );
+      ui_tclick = ui_now; ui_lastid = ui_h;
+    ) : (
+      set_val(ui_h, slider(CT[ui_h*12]) ? 0 : 1); ui_drag = -1;
+    );
+  ) : ui_drag = -1;
+);
+ui_md && ui_drag >= 0 ? (
+  ui_sens = (mouse_cap & 12) ? FH*5 : FH;
+  set_norm(ui_drag, ui_n0 + (ui_y0 - mouse_y)/ui_sens);
+);
+!ui_md ? ui_drag = -1;
+ui_last = ui_md;
+mouse_wheel != 0 ? (
+  ui_h = hit(mouse_x, mouse_y);
+  (ui_h >= 0 && CT[ui_h*12 + 9] == 0) ? wheel(ui_h, mouse_wheel > 0 ? 1 : -1);
+  mouse_wheel = 0;
+);
+
+// ---------- Rack ----------
+gfx_a = 1;
+gfx_r = gfx_g = gfx_b = 0.80; gfx_rect(0, 0, gfx_w, gfx_h);
+// Schrauben
+gfx_r = gfx_g = gfx_b = 0.15;
+gfx_circle(14, 60, 6, 1, 1); gfx_circle(14, 230, 6, 1, 1);
+
+gfx_setfont(3); gfx_r = gfx_g = gfx_b = 0.08;
+gfx_x = 30; gfx_y = 128; gfx_drawstr("Precision");
+gfx_x = 30; gfx_y = 148; gfx_drawstr("Limiter");
+
+// Linkes Feld (grau)
+gfx_r = gfx_g = gfx_b = 0.76; gfx_rect(120, 12, 352, 276);
+gfx_r = gfx_g = gfx_b = 0.50; gfx_roundrect(120, 12, 352, 276, 8, 1);
+// Rechtes Feld (blau)
+gfx_r = 0.62; gfx_g = 0.70; gfx_b = 0.90; gfx_rect(488, 12, 440, 276);
+gfx_r = 0.35; gfx_g = 0.42; gfx_b = 0.60; gfx_roundrect(488, 12, 440, 276, 8, 1);
+// Meterfeld
+gfx_r = gfx_g = gfx_b = 0.12; gfx_rect(944, 12, 136, 276);
+gfx_setfont(2); gfx_r = gfx_g = gfx_b = 0.85; ctext("METER", 1012, 20);
+
+ui_i = 0; loop(6, draw_fader(ui_i); ui_i += 1; );
+draw_btn(6); draw_btn(7);
+
+// Meter: IN (-30..+12 dBFS), GR (0..18 dB), OUT (-30..0 dBFS)
+ui_vin  = MIN[0];  MIN[0]  = ui_vin*0.85;
+ui_vgr  = MGR[0];  MGR[0]  = ui_vgr*0.85;
+ui_vout = MOUT[0]; MOUT[0] = ui_vout*0.85;
+draw_meter(958,  44, 200, ui_vin  > 0.00001 ? 20*log10(ui_vin)  : -100, -30, 12, 0, "IN");
+draw_meter(1001, 44, 200, ui_vgr, 0, 18, 1, "GR");
+draw_meter(1044, 44, 200, ui_vout > 0.00001 ? 20*log10(ui_vout) : -100, -30, 0, 0, "OUT");
+gfx_setfont(1); gfx_r = 1; gfx_g = 0.7; gfx_b = 0.3;
+sprintf(#ui_grt, "GR %.1f dB", ui_vgr); ctext(#ui_grt, 1012, 268);
