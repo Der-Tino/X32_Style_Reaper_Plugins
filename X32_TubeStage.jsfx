@@ -1,0 +1,309 @@
+desc:X32-style Tube Stage / Overdrive
+// Nachbau der Bedienlogik des X32/M32 "Tube Stage / Overdrive" fuer Offline-Uebung in REAPER.
+// Kein Klon des Original-DSP: Saettigungskennlinie und Drive-Skalierung sind angenaehert.
+//
+// Signalweg wie im X32-Handbuch:
+//   LO CUT / HI CUT (Eingang) -> Roehre (4x Oversampling) -> BASS / TREBLE Shelving (Ausgang) -> GAIN
+// DRIVE  = wie stark die Roehre angefahren wird (bringt auch etwas Pegel, ca. +3 dB bei 25 %)
+// EVEN   = geradzahlige Obertoene (asymmetrisch, "warm")
+// ODD    = ungeradzahlige Obertoene (symmetrisch, "kratziger")
+// Stehen EVEN und ODD auf 0, entstehen keine Obertoene, DRIVE wirkt dann nur als Pegel.
+//
+// Am X32 gibt es "Dual" (zwei Mono-Instanzen A/B in einem Slot) und "Stereo".
+// In REAPER einfach pro Spur eine Instanz einsetzen.
+//
+// Bedienung: Regler ziehen, Shift/Strg = fein, Doppelklick = Default, Mausrad = Schritte.
+
+slider1:drive=30<0,100,2>-Drive [%]
+slider2:even=20<0,50,1>-Even
+slider3:odd=20<0,50,1>-Odd
+slider4:gain=0<-12,12,0.5>-Gain [dB]
+slider5:locut=20<20,200,1:log>-Lo Cut [Hz]
+slider6:hicut=20000<4000,20000,10:log>-Hi Cut [Hz]
+slider7:bassg=0<-12,12,0.5>-Bass Gain [dB]
+slider8:bassf=100<50,400,1:log>-Bass Freq [Hz]
+slider9:trebg=0<-12,12,0.5>-Treble Gain [dB]
+slider10:trebf=3000<1000,10000,10:log>-Treble Freq [Hz]
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+OS = 4;                      // Oversampling-Faktor
+C_LC = 1000; C_HC = 1010;    // Koeffizienten Lo/Hi Cut
+C_BS = 1020; C_TS = 1030;    // Koeffizienten Bass/Treble Shelf
+C_AA = 1040;                 // 4 Biquads Anti-Aliasing (bei 4x Rate)
+ST = 2000;                   // Zustaende, 64 pro Kanal
+
+memset(ST, 0, 128);
+
+// ---- Biquad (TDF2) wie in den anderen Plugins ----
+function bq(c, s, x) local(y)
+(
+  y = c[0]*x + s[0];
+  s[0] = c[1]*x - c[3]*y + s[1];
+  s[1] = c[2]*x - c[4]*y;
+  y;
+);
+
+function set_lphp(c, type, f, q, fs) local(w, cs, al, a0)
+(
+  w = 2*$pi*f/fs; cs = cos(w); al = sin(w)/(2*q); a0 = 1 + al;
+  type == 0 ? ( c[0] = (1-cs)/2/a0; c[1] = (1-cs)/a0;  c[2] = c[0]; )
+            : ( c[0] = (1+cs)/2/a0; c[1] = -(1+cs)/a0; c[2] = c[0]; );
+  c[3] = -2*cs/a0; c[4] = (1-al)/a0;
+);
+
+// RBJ-Shelving, Slope S = 1
+function set_shelf(c, high, f, gdb) local(A, w, cs, sn, al, b0, b1, b2, a0, a1, a2, sq)
+(
+  A = 10^(gdb/40); w = 2*$pi*f/srate; cs = cos(w); sn = sin(w);
+  al = sn/2*sqrt(2); sq = 2*sqrt(A)*al;
+  high ? (
+    b0 =    A*((A+1) + (A-1)*cs + sq);
+    b1 = -2*A*((A-1) + (A+1)*cs);
+    b2 =    A*((A+1) + (A-1)*cs - sq);
+    a0 =       (A+1) - (A-1)*cs + sq;
+    a1 =    2*((A-1) - (A+1)*cs);
+    a2 =       (A+1) - (A-1)*cs - sq;
+  ) : (
+    b0 =    A*((A+1) - (A-1)*cs + sq);
+    b1 =  2*A*((A-1) - (A+1)*cs);
+    b2 =    A*((A+1) - (A-1)*cs - sq);
+    a0 =       (A+1) + (A-1)*cs + sq;
+    a1 =   -2*((A-1) + (A+1)*cs);
+    a2 =       (A+1) + (A-1)*cs - sq;
+  );
+  c[0] = b0/a0; c[1] = b1/a0; c[2] = b2/a0; c[3] = a1/a0; c[4] = a2/a0;
+);
+
+function tanh_(u) local(e) ( u > 20 ? 1 : u < -20 ? -1 : (e = exp(2*u); (e - 1)/(e + 1)); );
+
+// Roehrenkennlinie (bei 4x Rate)
+function tube(x) local(u, s)
+(
+  u = x*kd;
+  s = tanh_(u);
+  dgain*( (1 - ko)*x + ko*s/kd + ke*s*s/kd );
+);
+
+// Ein Kanal komplett; so = Zustands-Offset
+function chan(so, x) local(y, j, v, acc)
+(
+  // Eingangsfilter
+  x = bq(C_LC, so + 0, x);
+  x = bq(C_HC, so + 2, x);
+  // 4x Oversampling: hochsetzen, Roehre, Anti-Aliasing, runtersetzen
+  j = 0; acc = 0;
+  loop(OS,
+    v = (j == 0) ? x*OS : 0;
+    v = bq(C_AA,      so + 4,  v); v = bq(C_AA + 5,  so + 6,  v);
+    v = bq(C_AA + 10, so + 8,  v); v = bq(C_AA + 15, so + 10, v);
+    v = tube(v);
+    v = bq(C_AA,      so + 12, v); v = bq(C_AA + 5,  so + 14, v);
+    v = bq(C_AA + 10, so + 16, v); v = bq(C_AA + 15, so + 18, v);
+    j == 0 ? acc = v;
+    j += 1;
+  );
+  y = acc;
+  // DC-Blocker (gerade Obertoene erzeugen Gleichanteil)
+  so[30] = y - so[31] + 0.9995*so[30]; so[31] = y; y = so[30];
+  // Ausgangs-Shelving + Gain
+  y = bq(C_BS, so + 20, y);
+  y = bq(C_TS, so + 22, y);
+  y*outg;
+);
+
+function recalc()
+(
+  d   = drive/100;
+  kd  = 1 + 15*d;              // Ansteuerung der Roehre (bis +24 dB)
+  dgain = kd^0.22;             // Drive bringt etwas Pegel mit (~+3 dB bei 25 %)
+  ke  = even/50*d;            // gerade Obertoene wachsen mit Drive
+  ko  = odd/50;
+  outg = 10^(gain/20);
+  set_lphp(C_LC, 1, locut, 0.7071, srate);
+  set_lphp(C_HC, 0, min(hicut, srate*0.45), 0.7071, srate);
+  set_shelf(C_BS, 0, bassf, bassg);
+  set_shelf(C_TS, 1, min(trebf, srate*0.45), trebg);
+  // Butterworth 8. Ordnung bei 0.45*fs (gerechnet mit 4x Rate)
+  set_lphp(C_AA,      0, srate*0.45, 0.5097956, srate*OS);
+  set_lphp(C_AA + 5,  0, srate*0.45, 0.6013449, srate*OS);
+  set_lphp(C_AA + 10, 0, srate*0.45, 0.8999762, srate*OS);
+  set_lphp(C_AA + 15, 0, srate*0.45, 2.5629154, srate*OS);
+);
+
+// ================= UI =================
+CT = 30000; NCT = 10;
+// 0 slider, 1 x, 2 y, 3 r, 4 min, 5 max, 6 step, 7 def, 8 kurve (0 lin, 1 log)
+function defknob(id, sl, x, y, mn, mx, st, df, cv, lbl, rmin, rmax) local(p)
+( p = CT + id*12; p[0]=sl; p[1]=x; p[2]=y; p[3]=19; p[4]=mn; p[5]=mx; p[6]=st; p[7]=df; p[8]=cv;
+  strcpy(id, lbl); strcpy(id + 20, rmin); strcpy(id + 40, rmax); );
+
+R1 = 78; R2 = 190;
+defknob(0, 1, 182, R1,   0,   100, 2,     30, 0, "DRIVE",  "0",      "100");
+defknob(1, 2, 272, R1,   0,    50, 1,     20, 0, "EVEN",   "0",      "50");
+defknob(2, 3, 362, R1,   0,    50, 1,     20, 0, "ODD",    "0",      "50");
+defknob(3, 4, 457, R1, -12,    12, 0.5,    0, 0, "GAIN",   "-12 dB", "+12");
+defknob(4, 5, 628, R1,  20,   200, 1,     20, 1, "LO CUT", "20 Hz",  "200");
+defknob(5, 6, 722, R1, 4000, 20000, 10, 20000, 1, "HI CUT", "4 kHz",  "20");
+defknob(6, 7, 457, R2, -12,    12, 0.5,    0, 0, "BASS",   "-12 dB", "+12");
+defknob(7, 8, 542, R2,  50,   400, 1,    100, 1, "BASS",   "50 Hz",  "400");
+defknob(8, 9, 628, R2, -12,    12, 0.5,    0, 0, "TREBLE", "-12 dB", "+12");
+defknob(9, 10, 722, R2, 1000, 10000, 10, 3000, 1, "TREBLE", "1 kHz",  "10");
+strcpy(60, "GAIN"); strcpy(61, "FREQ");
+
+function ctext(str, cx, y) local(w, h)
+( gfx_measurestr(str, w, h); gfx_x = cx - w/2; gfx_y = y; gfx_drawstr(str); );
+
+function get_norm(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  p[8] == 1 ? log(v/p[4])/log(p[5]/p[4]) : (v - p[4])/(p[5] - p[4]);
+);
+function set_val(id, v) local(p)
+(
+  p = CT + id*12;
+  v != slider(p[0]) ? ( slider(p[0]) = v; slider_automate(2^(p[0]-1)); need_recalc = 1; );
+);
+function set_norm(id, n) local(p, v)
+(
+  p = CT + id*12; n = max(0, min(1, n));
+  v = p[8] == 1 ? p[4]*(p[5]/p[4])^n : p[4] + n*(p[5] - p[4]);
+  v = p[4] + floor((v - p[4])/p[6] + 0.5)*p[6];
+  set_val(id, max(p[4], min(p[5], v)));
+);
+function wheel(id, dir) local(p)
+(
+  p = CT + id*12;
+  (p[5] - p[4])/p[6] <= 60 ? set_val(id, max(p[4], min(p[5], slider(p[0]) + dir*p[6])))
+                           : set_norm(id, get_norm(id) + dir*0.02);
+);
+function hit(mx, my) local(id, p, r, found)
+(
+  found = -1; id = 0;
+  loop(NCT,
+    p = CT + id*12; r = p[3] + 10;
+    sqr(mx - p[1]) + sqr(my - p[2]) <= r*r ? found = id;
+    id += 1;
+  );
+  found;
+);
+function fmtval(id) local(p, v)
+(
+  p = CT + id*12; v = slider(p[0]);
+  id == 0 ? sprintf(#ui_v, "%d %%", v) :
+  (id == 1 || id == 2) ? sprintf(#ui_v, "%d", v) :
+  (id == 3 || id == 6 || id == 8) ? sprintf(#ui_v, "%+.1f dB", v) :
+  v >= 1000 ? sprintf(#ui_v, "%.2f kHz", v/1000) : sprintf(#ui_v, "%d Hz", v);
+);
+function red() ( gfx_r = 0.62; gfx_g = 0.12; gfx_b = 0.15; );
+
+function draw_knob(id) local(p, cx, cy, r, n, a, k, aa)
+(
+  p = CT + id*12; cx = p[1]; cy = p[2]; r = p[3];
+  n = get_norm(id);
+  a = -2.356 + 4.712*n;
+  // rote Skalenstriche, bis zum aktuellen Wert kraeftig
+  k = 0;
+  loop(21,
+    aa = -2.356 + 4.712*k/20;
+    k/20 <= n + 0.001 ? red() : (gfx_r = 0.85; gfx_g = 0.62; gfx_b = 0.62;);
+    gfx_line(cx + sin(aa)*(r + 4), cy - cos(aa)*(r + 4), cx + sin(aa)*(r + 9), cy - cos(aa)*(r + 9), 1);
+    k += 1;
+  );
+  // schwarzer Knopf mit Glanz
+  gfx_r = gfx_g = gfx_b = 0.05; gfx_circle(cx, cy, r, 1, 1);
+  gfx_r = gfx_g = gfx_b = 0.22; gfx_circle(cx - 4, cy - 5, r*0.45, 1, 1);
+  gfx_r = gfx_g = gfx_b = 0.05; gfx_circle(cx - 2, cy - 2, r*0.40, 1, 1);
+  gfx_r = gfx_g = gfx_b = 0.97;
+  gfx_line(cx + sin(a)*r*0.35, cy - cos(a)*r*0.35, cx + sin(a)*r*0.95, cy - cos(a)*r*0.95, 1);
+  gfx_line(cx + sin(a)*r*0.35 + 1, cy - cos(a)*r*0.35, cx + sin(a)*r*0.95 + 1, cy - cos(a)*r*0.95, 1);
+  // Beschriftung
+  gfx_setfont(2); red();
+  (id >= 6) ? ( ctext(id, cx, cy - r - 40); ctext(id == 6 || id == 8 ? 60 : 61, cx, cy - r - 26); )
+            : ctext(id, cx, cy - r - 26);
+  gfx_setfont(1); gfx_r = gfx_g = gfx_b = 0.15;
+  gfx_x = cx - r - 14; gfx_y = cy + r + 6; gfx_drawstr(id + 20);
+  gfx_x = cx + r - 4;  gfx_y = cy + r + 6; gfx_drawstr(id + 40);
+  // aktueller Wert beim Bewegen oder Drueberfahren
+  (ui_drag == id || ui_hover == id) ? (
+    fmtval(id); gfx_setfont(2);
+    gfx_r = gfx_g = gfx_b = 0.1; ctext(#ui_v, cx, cy + r + 20);
+  );
+);
+
+recalc();
+
+@slider
+recalc();
+
+@block
+need_recalc ? ( need_recalc = 0; recalc(); );
+
+@sample
+spl0 = chan(ST,      spl0);
+spl1 = chan(ST + 64, spl1);
+
+@gfx 900 250
+gfx_setfont(1, "Arial", 12);
+gfx_setfont(2, "Arial", 13, 'b');
+gfx_setfont(3, "Georgia", 30, 'bi');
+gfx_setfont(4, "Arial", 34, 'b');
+
+// ---------- Maus ----------
+ui_md = mouse_cap & 1;
+ui_hover = hit(mouse_x, mouse_y);
+ui_md && !ui_last ? (
+  ui_h = ui_hover;
+  ui_h >= 0 ? (
+    ui_now = time_precise();
+    (ui_now - ui_tclick < 0.3 && ui_lastid == ui_h) ? (
+      set_val(ui_h, CT[ui_h*12 + 7]); ui_drag = -1;
+    ) : (
+      ui_drag = ui_h; ui_y0 = mouse_y; ui_n0 = get_norm(ui_h);
+    );
+    ui_tclick = ui_now; ui_lastid = ui_h;
+  ) : ui_drag = -1;
+);
+ui_md && ui_drag >= 0 ? (
+  ui_sens = (mouse_cap & 12) ? 900 : 180;
+  set_norm(ui_drag, ui_n0 + (ui_y0 - mouse_y)/ui_sens);
+);
+!ui_md ? ui_drag = -1;
+ui_last = ui_md;
+mouse_wheel != 0 ? (
+  ui_hover >= 0 ? wheel(ui_hover, mouse_wheel > 0 ? 1 : -1);
+  mouse_wheel = 0;
+);
+
+// ---------- Rack mit roter Spirale ----------
+gfx_a = 1;
+gfx_r = gfx_g = gfx_b = 0.90; gfx_rect(0, 0, gfx_w, gfx_h);
+red(); gfx_a = 0.9;
+ui_k = 0;
+loop(4,
+  ui_rr = 240 - ui_k*60;
+  ui_j = 0;
+  loop(16, gfx_arc(gfx_w - 40, 260, ui_rr + ui_j, -1.6, 0.2, 1); ui_j += 1; );
+  ui_k += 1;
+);
+gfx_a = 1;
+// Griffe + Schrauben
+gfx_r = gfx_g = gfx_b = 0.08;
+gfx_rect(36, 85, 18, 70); gfx_rect(gfx_w - 54, 85, 18, 70);
+gfx_circle(12, 28, 6, 1, 1); gfx_circle(12, 222, 6, 1, 1);
+gfx_circle(gfx_w - 12, 28, 6, 1, 1); gfx_circle(gfx_w - 12, 222, 6, 1, 1);
+gfx_setfont(4); red(); gfx_x = 46; gfx_y = 16; gfx_drawstr("A");
+
+// Bedienfeld
+gfx_r = gfx_g = gfx_b = 0.93; gfx_rect(120, 12, 670, 226);
+red(); gfx_roundrect(120, 12, 670, 226, 14, 1); gfx_roundrect(121, 13, 668, 224, 13, 1);
+
+gfx_setfont(3); red();
+gfx_x = 132; gfx_y = 150; gfx_drawstr("Dual Tube Stage");
+gfx_x = 160; gfx_y = 188; gfx_drawstr("/Overdrive");
+
+ui_i = 0; loop(NCT, draw_knob(ui_i); ui_i += 1; );
